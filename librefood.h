@@ -33,7 +33,9 @@ typedef struct {
     char *product_name;
     char *brand;
     char *image_url;
+    char *quantity;           /* e.g. "400 g"; "" if unknown */
     char *nutriscore_grade;   /* "a".."e" or NULL */
+    char *ecoscore_grade;     /* "a-plus","a".."f" or NULL */
     /* Nutriment values per 100 g; NAN when unknown (distinct from 0). */
     double energy_kcal;
     double fat;
@@ -46,7 +48,11 @@ typedef struct {
     char  *ingredients_text;
     char  *nova_group;        /* "1".."4" */
     int    additives_count;
-    char **additives;         /* NULL-terminated list */
+    char **additives;         /* NULL-terminated codes, e.g. "e322" */
+    char **allergens;         /* NULL-terminated display names */
+    char **traces;            /* NULL-terminated display names */
+    char **labels;            /* NULL-terminated display names */
+    GdkTexture *image;        /* downloaded front image, or NULL */
 } Product;
 
 /* ── App state ── */
@@ -67,7 +73,10 @@ typedef struct {
     GtkWidget       *scan_entry;
     GtkWidget       *scan_button;
     GtkWidget       *camera_button;
+    GtkWidget       *error_revealer;
+    GtkWidget       *error_label;
     GtkWidget       *history_list;
+    GtkWidget       *clear_history_button;
 
     /* ── Loading page ── */
     GtkWidget       *loading_page;
@@ -79,6 +88,10 @@ typedef struct {
     GtkWidget       *product_image;
     GtkWidget       *product_name_label;
     GtkWidget       *brand_label;
+    GtkWidget       *eco_badge;
+    GtkWidget       *eco_letter;
+    GtkWidget       *eco_desc;
+    GtkWidget       *nova_num;
     GtkWidget       *score_badge;
     GtkWidget       *score_letter;
     GtkWidget       *score_desc;
@@ -87,6 +100,11 @@ typedef struct {
     GtkWidget       *nutrition_grid;
     GtkWidget       *ingredients_label;
     GtkWidget       *additives_box;
+    GtkWidget       *allergens_box;
+    GtkWidget       *traces_label;
+    GtkWidget       *labels_card;
+    GtkWidget       *labels_box;
+    GtkWidget       *off_link;
 
     /* HTTP session */
     SoupSession     *http_session;
@@ -124,7 +142,8 @@ void show_error(AppState *state, const char *msg);
 
 /* HTTP / parsing */
 void fetch_product(AppState *state, const char *barcode);
-void fetch_image(AppState *state, const char *url);
+/* Shows p's front image: from p->image if cached, else downloads it. */
+void fetch_image(AppState *state, Product *p);
 void cancel_network(AppState *state);
 /* Parses a full OFF API response object. Returns NULL unless status == 1
  * and a product object is present. Tolerates null/mistyped fields. */
@@ -135,10 +154,25 @@ char *barcode_normalize(const char *input);
 
 /* History */
 void history_add(AppState *state, Product *p);
+void history_clear(AppState *state);
+void refresh_history(AppState *state);
+Product *history_find(AppState *state, const char *barcode);
 
 /* Helpers */
 const char *score_color(const char *grade);
 const char *score_description(const char *grade);
+const char *ecoscore_color(const char *grade);
+const char *ecoscore_label(const char *grade);   /* "A+", "A".."F", "?" */
+const char *ecoscore_description(const char *grade);
+/* "en:no-gluten" → "No gluten" (newly allocated) */
+char *tag_display_name(const char *tag);
+/* "e322i" → "Lecithin"; NULL if unknown */
+const char *additive_name(const char *code);
+/* "e322i" → "E322i · Lecithin" (newly allocated) */
+char *additive_display(const char *code);
+/* 539 → "539", 0.107 → "0.11", 30.9 → "30.9" (newly allocated) */
+char *format_amount(double v);
+double nutrient_fraction(const char *nutrient, double per100g);
 const char *nova_description(const char *nova);
 void product_free(Product *p);
 void apply_css(void);

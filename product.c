@@ -9,11 +9,13 @@ void product_free(Product *p) {
     g_free(p->nutriscore_grade);
     g_free(p->ingredients_text);
     g_free(p->nova_group);
-    if (p->additives) {
-        for (int i = 0; p->additives[i]; i++)
-            g_free(p->additives[i]);
-        g_free(p->additives);
-    }
+    g_free(p->quantity);
+    g_free(p->ecoscore_grade);
+    g_strfreev(p->additives);
+    g_strfreev(p->allergens);
+    g_strfreev(p->traces);
+    g_strfreev(p->labels);
+    g_clear_object(&p->image);
     g_free(p);
 }
 
@@ -39,6 +41,77 @@ const char *score_description(const char *grade) {
         case 'e': case 'E': return "Bad";
         default:            return "Unknown";
     }
+}
+
+/* Eco-Score (now "Green-Score" on OFF; the API field is still ecoscore_*). */
+const char *ecoscore_color(const char *grade) {
+    if (!grade) return "ns-score-unknown";
+    if (strcmp(grade, "a-plus") == 0) return "ns-score-aplus";
+    return score_color(grade);
+}
+
+const char *ecoscore_label(const char *grade) {
+    if (!grade) return "?";
+    if (strcmp(grade, "a-plus") == 0) return "A+";
+    static const char *letters[] = { "A", "B", "C", "D", "E", "F" };
+    if (grade[0] >= 'a' && grade[0] <= 'f' && grade[1] == '\0')
+        return letters[grade[0] - 'a'];
+    return "?";
+}
+
+const char *ecoscore_description(const char *grade) {
+    if (!grade) return "Unknown impact";
+    if (strcmp(grade, "a-plus") == 0) return "Very low impact";
+    switch (grade[0]) {
+        case 'a': return "Very low impact";
+        case 'b': return "Low impact";
+        case 'c': return "Moderate impact";
+        case 'd': return "High impact";
+        case 'e': return "Very high impact";
+        case 'f': return "Very high impact";
+        default:  return "Unknown impact";
+    }
+}
+
+char *tag_display_name(const char *tag) {
+    if (!tag) return g_strdup("");
+    const char *colon = strchr(tag, ':');
+    const char *name = colon ? colon + 1 : tag;
+    char *out = g_strdup(name);
+    for (char *c = out; *c; c++)
+        if (*c == '-' || *c == '_') *c = ' ';
+    if (out[0]) out[0] = g_ascii_toupper(out[0]);
+    return out;
+}
+
+char *format_amount(double v) {
+    if (isnan(v)) return g_strdup("—");
+    if (v >= 100.0) return g_strdup_printf("%.0f", v);
+    if (v >= 10.0 || v == 0.0) {
+        char *s = g_strdup_printf("%.1f", v);
+        if (g_str_has_suffix(s, ".0")) s[strlen(s) - 2] = '\0';
+        return s;
+    }
+    char *s = g_strdup_printf("%.2f", v);
+    /* trim trailing zeros: 6.30 → 6.3, 2.00 → 2 */
+    char *end = s + strlen(s) - 1;
+    while (*end == '0') *end-- = '\0';
+    if (*end == '.') *end = '\0';
+    return s;
+}
+
+/* Bar fill for a nutrient row: the "high" threshold sits at 2/3 of the bar,
+ * so LOW/MOD/HIGH map to visibly distinct lengths. NAN → 0. */
+double nutrient_fraction(const char *nutrient, double per100g) {
+    if (!nutrient || isnan(per100g)) return 0.0;
+    double high;
+    if      (strcmp(nutrient, "fat") == 0)           high = 17.5;
+    else if (strcmp(nutrient, "saturated_fat") == 0) high = 5.0;
+    else if (strcmp(nutrient, "sugars") == 0)        high = 22.5;
+    else if (strcmp(nutrient, "salt") == 0)          high = 1.5;
+    else return 0.0;
+    double f = per100g / (high * 1.5);
+    return f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f);
 }
 
 const char *nova_description(const char *nova) {
@@ -143,6 +216,32 @@ static double nutriment(JsonObject *nm, const char *key) {
     return v;
 }
 
+/* Reads an array of "xx:tag" strings into a NULL-terminated list, skipping
+ * non-strings and duplicates. pretty: "No gluten" vs raw "no-gluten". */
+#define LF_MAX_TAGS 64
+static char **tag_list(JsonObject *o, const char *key, gboolean pretty) {
+    GPtrArray *out = g_ptr_array_new();
+    JsonArray *arr = array_member(o, key);
+    guint len = arr ? json_array_get_length(arr) : 0;
+    for (guint i = 0; i < len && out->len < LF_MAX_TAGS; i++) {
+        JsonNode *el = json_array_get_element(arr, i);
+        if (!el || !JSON_NODE_HOLDS_VALUE(el) ||
+            json_node_get_value_type(el) != G_TYPE_STRING)
+            continue;
+        const char *tag = json_node_get_string(el);
+        if (!tag || !*tag) continue;
+        const char *colon = strchr(tag, ':');
+        char *v = pretty ? tag_display_name(tag) : g_strdup(colon ? colon + 1 : tag);
+        if (!v[0] || g_ptr_array_find_with_equal_func(out, v, g_str_equal, NULL)) {
+            g_free(v);
+            continue;
+        }
+        g_ptr_array_add(out, v);
+    }
+    g_ptr_array_add(out, NULL);
+    return (char **)g_ptr_array_free(out, FALSE);
+}
+
 Product *parse_product_json(JsonObject *root, const char *barcode) {
     if (!root) return NULL;
 
@@ -188,23 +287,18 @@ Product *parse_product_json(JsonObject *root, const char *barcode) {
     p->protein       = nutriment(nm, "proteins_100g");
     p->salt          = nutriment(nm, "salt_100g");
 
-    /* Additives: skip any non-string elements */
-    JsonArray *arr = array_member(prod, "additives_tags");
-    guint len = arr ? json_array_get_length(arr) : 0;
-    p->additives = g_new0(char *, len + 1);
-    int count = 0;
-    for (guint i = 0; i < len; i++) {
-        JsonNode *el = json_array_get_element(arr, i);
-        if (!el || !JSON_NODE_HOLDS_VALUE(el) ||
-            json_node_get_value_type(el) != G_TYPE_STRING)
-            continue;
-        const char *tag = json_node_get_string(el);
-        if (!tag || !*tag) continue;
-        /* strip "en:" prefix */
-        const char *colon = strchr(tag, ':');
-        p->additives[count++] = g_strdup(colon ? colon + 1 : tag);
-    }
-    p->additives_count = count;
+    p->quantity = dup_string_member(prod, "quantity");
+
+    const char *eco = string_member(prod, "ecoscore_grade");
+    if (eco && (strcmp(eco, "a-plus") == 0 ||
+                (strlen(eco) == 1 && eco[0] >= 'a' && eco[0] <= 'f')))
+        p->ecoscore_grade = g_strdup(eco);
+
+    p->additives = tag_list(prod, "additives_tags", FALSE);
+    p->additives_count = (int)g_strv_length(p->additives);
+    p->allergens = tag_list(prod, "allergens_tags", TRUE);
+    p->traces    = tag_list(prod, "traces_tags", TRUE);
+    p->labels    = tag_list(prod, "labels_tags", TRUE);
 
     /* Fallback name */
     if (p->product_name[0] == '\0') {

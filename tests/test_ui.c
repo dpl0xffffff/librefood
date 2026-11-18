@@ -39,6 +39,19 @@ static void spin(double secs) { wait_for(c_false, secs); }
 static gboolean c_home(void)    { return g_strcmp0(page(), "home") == 0; }
 static gboolean c_product(void) { return g_strcmp0(page(), "product") == 0; }
 static gboolean c_cam_idle(void){ return S->camera_proc == NULL; }
+static gboolean c_has_image(void) {
+    Product *p = S->history ? S->history->data : NULL;
+    return p && p->image;
+}
+static gboolean banner_shown(void) {
+    return gtk_revealer_get_reveal_child(GTK_REVEALER(S->error_revealer));
+}
+static const char *banner_text(void) {
+    return gtk_label_get_text(GTK_LABEL(S->error_label));
+}
+static void activate(const char *action) {
+    g_action_group_activate_action(G_ACTION_GROUP(S->window), action, NULL);
+}
 
 static gboolean lookup_to(const char *bc, gboolean (*cond)(void), double secs) {
     show_home(S);
@@ -72,6 +85,8 @@ static void run_tests(GtkApplication *app, gpointer pidfile) {
 
     /* ── input validation ── */
     CHECK(!do_lookup(S, "abc") && c_home(), "non-numeric input rejected, stays home");
+    CHECK(banner_shown() && strstr(banner_text(), "valid barcode"),
+          "invalid input shows inline error banner");
     CHECK(!do_lookup(S, "../x") && c_home(), "path-like input rejected");
 
     /* ── happy path ── */
@@ -80,12 +95,34 @@ static void run_tests(GtkApplication *app, gpointer pidfile) {
     CHECK(g_strcmp0(gtk_label_get_text(GTK_LABEL(S->nova_desc)), "Ultra-processed") == 0,
           "NOVA description populated");
     CHECK(g_list_length(S->history) == 1, "history has 1 entry");
+    CHECK(!banner_shown(), "successful lookup hides error banner");
+    CHECK(g_strcmp0(gtk_label_get_text(GTK_LABEL(S->eco_letter)), "D") == 0,
+          "Eco-Score shown");
+    CHECK(g_strcmp0(gtk_label_get_text(GTK_LABEL(S->brand_label)), "Ferrero · 400 g") == 0,
+          "brand · quantity shown");
+    CHECK(gtk_widget_get_visible(S->labels_card), "labels card visible when labels exist");
+    CHECK(gtk_widget_get_visible(S->traces_label), "traces line visible");
+    CHECK(g_str_has_suffix(gtk_link_button_get_uri(GTK_LINK_BUTTON(S->off_link)),
+                           "/product/30176204"), "OFF link points at product");
+    GtkWidget *chip = gtk_widget_get_first_child(
+        gtk_widget_get_first_child(S->additives_box));
+    CHECK(chip && GTK_IS_LABEL(chip) &&
+          g_strcmp0(gtk_label_get_text(GTK_LABEL(chip)), "E322 · Lecithins") == 0,
+          "additive chip shows name");
+    CHECK(wait_for(c_has_image, 5), "product image downloaded and cached");
+    GtkWidget *hrow = GTK_WIDGET(gtk_list_box_get_row_at_index(GTK_LIST_BOX(S->history_list), 0));
+    GtkWidget *thumb = gtk_widget_get_first_child(gtk_widget_get_first_child(hrow));
+    CHECK(thumb && GTK_IS_IMAGE(thumb) &&
+          gtk_image_get_storage_type(GTK_IMAGE(thumb)) == GTK_IMAGE_PAINTABLE,
+          "history row shows thumbnail");
     CHECK(lookup_to("3017 6204", c_product, 5), "spaces in barcode accepted");
     CHECK(g_list_length(S->history) == 1, "re-scan does not duplicate history");
 
     /* ── failure responses must return to home, not hang on spinner ── */
     CHECK(lookup_to("11111111", c_home, 5), "not-found (status 0) returns home");
+    CHECK(banner_shown() && strstr(banner_text(), "not found"), "not-found message in banner");
     CHECK(lookup_to("22222222", c_home, 5), "HTTP 503 returns home");
+    CHECK(strstr(banner_text(), "HTTP 503") != NULL, "HTTP status in banner");
     CHECK(lookup_to("33333333", c_home, 5), "malformed JSON returns home");
     CHECK(lookup_to("77777777", c_home, 5), "non-object JSON root returns home");
     CHECK(lookup_to("99999999", c_home, 5), "HTTP 404 returns home");
@@ -94,6 +131,8 @@ static void run_tests(GtkApplication *app, gpointer pidfile) {
     /* ── null-heavy product ── */
     CHECK(lookup_to("44444444", c_product, 5), "all-null product renders");
     CHECK(g_strcmp0(title(), "Unknown product") == 0, "fallback name used");
+    CHECK(!gtk_widget_get_visible(S->labels_card), "labels card hidden when none");
+    CHECK(!gtk_widget_get_visible(S->traces_label), "traces line hidden when none");
     CHECK(g_list_length(S->history) == 2, "history has 2 entries");
 
     /* ── timeout ── */
@@ -102,6 +141,22 @@ static void run_tests(GtkApplication *app, gpointer pidfile) {
     CHECK(lookup_to("55555555", c_home, 4), "slow server times out back to home");
     g_print("       (timed out after %.1fs)\n", (g_get_monotonic_time() - t0) / 1e6);
     g_object_set(S->http_session, "timeout", LF_HTTP_TIMEOUT_SEC, NULL);
+
+    /* ── keyboard actions ── */
+    show_home(S);
+    do_lookup(S, "66666666");
+    activate("back");                         /* Esc while loading = cancel */
+    CHECK(c_home() && S->fetch_cancel == NULL, "Esc cancels an in-flight lookup");
+    spin(2.0);
+    CHECK(c_home(), "cancelled lookup does not come back");
+    CHECK(lookup_to("30176204", c_product, 5), "lookup after cancel works");
+    activate("back");
+    CHECK(c_home(), "Esc on product page goes back");
+    CHECK(lookup_to("30176204", c_product, 5), "re-open product");
+    activate("focus-search");
+    CHECK(c_home() && gtk_widget_has_focus(gtk_widget_get_first_child(S->scan_entry)) ,
+          "Ctrl+L goes home and focuses search");
+    CHECK(c_has_image(), "re-scan keeps cached image");
 
     /* ── race: slow lookup superseded by a fast one ── */
     show_home(S);
@@ -127,6 +182,22 @@ static void run_tests(GtkApplication *app, gpointer pidfile) {
         CHECK(c_product() && g_strcmp0(title(), expect->product_name) == 0,
               "history activation shows that product (%s)", title());
     }
+
+    /* ── clear history ── */
+    show_home(S);
+    CHECK(gtk_widget_get_visible(S->clear_history_button), "Clear visible with history");
+    guint n_before = g_list_length(S->history);
+    g_signal_emit_by_name(S->clear_history_button, "clicked");
+    CHECK(n_before > 0 && S->history == NULL && S->current_product == NULL,
+          "Clear empties history");
+    CHECK(gtk_list_box_get_row_at_index(GTK_LIST_BOX(S->history_list), 0) == NULL,
+          "history list emptied");
+    CHECK(!gtk_widget_get_visible(S->clear_history_button), "Clear hidden when empty");
+    /* image download finishing after its product was cleared must be safe */
+    CHECK(lookup_to("30176204", c_product, 5), "lookup after clear");
+    history_clear(S);
+    spin(1.0);
+    CHECK(TRUE, "image completion after clear did not crash");
 
     /* ── camera: successful scan ── */
     show_home(S);

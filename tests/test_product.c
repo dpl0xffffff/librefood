@@ -117,6 +117,72 @@ static void test_barcode_normalize(void) {
     g_assert_null(barcode_normalize("30176204%2F22003"));
 }
 
+static void test_extra_fields(void) {
+    Product *p = parse(
+        "{\"status\":1,\"product\":{\"quantity\":\"400 g\","
+        "\"ecoscore_grade\":\"a-plus\","
+        "\"allergens_tags\":[\"en:milk\",\"en:nuts\",\"en:milk\",5],"
+        "\"traces_tags\":[],"
+        "\"labels_tags\":[\"en:no-gluten\",\"fr:ab-agriculture-biologique\"]}}");
+    g_assert_nonnull(p);
+    g_assert_cmpstr(p->quantity, ==, "400 g");
+    g_assert_cmpstr(p->ecoscore_grade, ==, "a-plus");
+    g_assert_cmpstr(ecoscore_label(p->ecoscore_grade), ==, "A+");
+    g_assert_cmpuint(g_strv_length(p->allergens), ==, 2);      /* deduped */
+    g_assert_cmpstr(p->allergens[0], ==, "Milk");
+    g_assert_cmpuint(g_strv_length(p->traces), ==, 0);
+    g_assert_cmpstr(p->labels[0], ==, "No gluten");
+    g_assert_cmpstr(p->labels[1], ==, "Ab agriculture biologique");
+    product_free(p);
+
+    p = parse("{\"status\":1,\"product\":{\"ecoscore_grade\":\"not-applicable\","
+              "\"quantity\":null}}");
+    g_assert_null(p->ecoscore_grade);
+    g_assert_cmpstr(ecoscore_label(p->ecoscore_grade), ==, "?");
+    g_assert_cmpstr(p->quantity, ==, "");
+    g_assert_nonnull(p->allergens);
+    g_assert_null(p->allergens[0]);
+    product_free(p);
+}
+
+static void test_additive_names(void) {
+    g_assert_cmpstr(additive_name("e322"), ==, "Lecithins");
+    g_assert_cmpstr(additive_name("e322i"), ==, "Lecithins");     /* variant */
+    g_assert_cmpstr(additive_name("E150d"), ==, "Sulphite ammonia caramel");
+    g_assert_cmpstr(additive_name("e500ii"), ==, "Sodium carbonates");
+    g_assert_null(additive_name("e9999"));
+    g_assert_null(additive_name(""));
+    g_assert_null(additive_name(NULL));
+    char *d = additive_display("e330");
+    g_assert_cmpstr(d, ==, "E330 · Citric acid"); g_free(d);
+    d = additive_display("e9999");
+    g_assert_cmpstr(d, ==, "E9999"); g_free(d);
+}
+
+static void test_format_amount(void) {
+    struct { double v; const char *s; } cases[] = {
+        { 539, "539" }, { 30.9, "30.9" }, { 10.0, "10" }, { 6.3, "6.3" },
+        { 0.107, "0.11" }, { 2.0, "2" }, { 0, "0" }, { NAN, "—" }, { 0.001, "0" },
+    };
+    for (gsize i = 0; i < G_N_ELEMENTS(cases); i++) {
+        char *s = format_amount(cases[i].v);
+        g_assert_cmpstr(s, ==, cases[i].s);
+        g_free(s);
+    }
+    g_assert_cmpfloat(nutrient_fraction("salt", 100), ==, 1.0);
+    g_assert_cmpfloat(nutrient_fraction("salt", NAN), ==, 0.0);
+    g_assert_cmpfloat(nutrient_fraction("protein", 5), ==, 0.0);
+}
+
+static void test_tag_display(void) {
+    char *s = tag_display_name("en:fair-trade_x");
+    g_assert_cmpstr(s, ==, "Fair trade x"); g_free(s);
+    s = tag_display_name("plain");
+    g_assert_cmpstr(s, ==, "Plain"); g_free(s);
+    s = tag_display_name("en:");
+    g_assert_cmpstr(s, ==, ""); g_free(s);
+}
+
 static void test_nutrient_level_nan(void) {
     g_assert_null(nutrient_level("fat", NAN));
     g_assert_cmpstr(nutrient_level("fat", 1.0), ==, "LOW");
@@ -132,5 +198,9 @@ int main(int argc, char **argv) {
     g_test_add_func("/product/not-found", test_not_found);
     g_test_add_func("/barcode/normalize", test_barcode_normalize);
     g_test_add_func("/nutrient/level-nan", test_nutrient_level_nan);
+    g_test_add_func("/product/extra-fields", test_extra_fields);
+    g_test_add_func("/additives/names", test_additive_names);
+    g_test_add_func("/format/amount", test_format_amount);
+    g_test_add_func("/tags/display", test_tag_display);
     return g_test_run();
 }

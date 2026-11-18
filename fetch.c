@@ -46,18 +46,22 @@ void cancel_network(AppState *state) {
 
 /* ── Product image ── */
 
+typedef struct {
+    AppState     *state;
+    GCancellable *cancel;
+    char         *barcode;    /* product looked up again on completion: it
+                               * may have been evicted from history */
+} ImageCtx;
+
 static void on_image_ready(GObject *source, GAsyncResult *res, gpointer user_data) {
-    GCancellable *cancel = user_data;          /* owned reference */
+    ImageCtx *ctx = user_data;
+    AppState *state = ctx->state;
     GError *error = NULL;
     GBytes *bytes = soup_session_send_and_read_finish(SOUP_SESSION(source), res, &error);
 
-    if (g_cancellable_is_cancelled(cancel)) {
-        /* Superseded by a newer product view: drop silently. */
-        goto out;
-    }
-    AppState *state = g_object_get_data(G_OBJECT(cancel), "state");
-    if (!state) goto out;
-    if (state->image_cancel == cancel)
+    if (g_cancellable_is_cancelled(ctx->cancel))
+        goto out;                          /* superseded: drop silently */
+    if (state->image_cancel == ctx->cancel)
         g_clear_object(&state->image_cancel);
 
     if (!bytes) {
@@ -68,27 +72,43 @@ static void on_image_ready(GObject *source, GAsyncResult *res, gpointer user_dat
     }
 
     GdkTexture *texture = gdk_texture_new_from_bytes(bytes, &error);
-    if (texture) {
-        gtk_image_set_from_paintable(GTK_IMAGE(state->product_image),
-                                     GDK_PAINTABLE(texture));
-        g_object_unref(texture);
-    } else {
+    if (!texture) {
         g_warning("librefood: could not decode product image: %s",
                   error ? error->message : "unknown error");
+        goto out;
     }
+
+    Product *p = history_find(state, ctx->barcode);
+    if (p) {
+        g_set_object(&p->image, texture);  /* cache: no re-download */
+        refresh_history(state);            /* thumbnail */
+    }
+    if (state->current_product &&
+        g_strcmp0(state->current_product->barcode, ctx->barcode) == 0)
+        gtk_image_set_from_paintable(GTK_IMAGE(state->product_image),
+                                     GDK_PAINTABLE(texture));
+    g_object_unref(texture);
 
 out:
     g_clear_error(&error);
     if (bytes) g_bytes_unref(bytes);
-    g_object_unref(cancel);
+    g_object_unref(ctx->cancel);
+    g_free(ctx->barcode);
+    g_free(ctx);
 }
 
-/* Cancels any pending image download, then starts one for url (if any). */
-void fetch_image(AppState *state, const char *url) {
+void fetch_image(AppState *state, Product *p) {
     if (state->image_cancel) {
         g_cancellable_cancel(state->image_cancel);
         g_clear_object(&state->image_cancel);
     }
+    if (!p) return;
+    if (p->image) {
+        gtk_image_set_from_paintable(GTK_IMAGE(state->product_image),
+                                     GDK_PAINTABLE(p->image));
+        return;
+    }
+    const char *url = p->image_url;
     if (!url || !(g_str_has_prefix(url, "https://") ||
                   g_str_has_prefix(url, "http://")))
         return;
@@ -99,10 +119,12 @@ void fetch_image(AppState *state, const char *url) {
         return;
     }
     state->image_cancel = g_cancellable_new();
-    g_object_set_data(G_OBJECT(state->image_cancel), "state", state);
+    ImageCtx *ctx = g_new0(ImageCtx, 1);
+    ctx->state   = state;
+    ctx->cancel  = g_object_ref(state->image_cancel);
+    ctx->barcode = g_strdup(p->barcode);
     soup_session_send_and_read_async(state->http_session, msg,
-        G_PRIORITY_LOW, state->image_cancel, on_image_ready,
-        g_object_ref(state->image_cancel));
+        G_PRIORITY_LOW, ctx->cancel, on_image_ready, ctx);
     g_object_unref(msg);
 }
 
