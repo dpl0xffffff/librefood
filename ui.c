@@ -23,7 +23,7 @@ GtkWidget *make_nutrient_row(const char *name, double value,
     gtk_widget_set_hexpand(name_lbl, TRUE);
 
     char val_str[64];
-    if (value == 0.0 && strcmp(unit, "kcal") != 0)
+    if (isnan(value))                     /* unknown — not the same as 0 */
         snprintf(val_str, sizeof(val_str), "—");
     else
         snprintf(val_str, sizeof(val_str), "%.1f %s", value, unit);
@@ -57,24 +57,11 @@ static void on_history_activated(GtkListBox *lb, GtkListBoxRow *row, gpointer us
     (void)lb;
     AppState *state = user_data;
     int idx = gtk_list_box_row_get_index(row);
-    GList *entry = g_list_nth(state->history, idx);
+    if (idx < 0) return;
+    GList *entry = g_list_nth(state->history, (guint)idx);
     if (!entry) return;
-    Product *p = entry->data;
-    show_product(state, p);
-    if (p->image_url && p->image_url[0] != '\0') {
-        /* Re-fetch image since we don't cache pixbufs */
-        SoupMessage *msg = soup_message_new(SOUP_METHOD_GET, p->image_url);
-        if (msg) {
-            SoupMessageHeaders *hdrs = soup_message_get_request_headers(msg);
-            soup_message_headers_replace(hdrs, "User-Agent",
-                "librefood/1.0 (davide.plozner@etik.com)");
-            soup_session_send_and_read_async(state->http_session, msg,
-                G_PRIORITY_DEFAULT, NULL,
-                (GAsyncReadyCallback)(void*)on_history_activated, /* placeholder */
-                state->product_image);
-            g_object_unref(msg);
-        }
-    }
+    state->current_product = entry->data;
+    show_product(state, entry->data);   /* re-fetches the image */
 }
 
 static GtkWidget *make_history_row(Product *p) {
@@ -127,6 +114,43 @@ static GtkWidget *make_history_row(Product *p) {
     return row_box;
 }
 
+/* Rebuilds the "Recent scans" list; row index == position in history. */
+static void refresh_history(AppState *state) {
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child(state->history_list)))
+        gtk_list_box_remove(GTK_LIST_BOX(state->history_list), child);
+
+    for (GList *l = state->history; l; l = l->next)
+        gtk_list_box_insert(GTK_LIST_BOX(state->history_list),
+                            make_history_row(l->data), -1);
+}
+
+/* Takes ownership of p. Re-scanning a product moves it to the top instead of
+ * duplicating it, and the list is bounded to LF_HISTORY_MAX entries. */
+void history_add(AppState *state, Product *p) {
+    GList *l = state->history;
+    while (l) {
+        GList *next = l->next;
+        Product *old = l->data;
+        if (old != p && g_strcmp0(old->barcode, p->barcode) == 0) {
+            if (state->current_product == old) state->current_product = NULL;
+            product_free(old);
+            state->history = g_list_delete_link(state->history, l);
+        }
+        l = next;
+    }
+    state->history = g_list_prepend(state->history, p);
+
+    while (g_list_length(state->history) > LF_HISTORY_MAX) {
+        GList *last = g_list_last(state->history);
+        if (state->current_product == last->data) state->current_product = NULL;
+        product_free(last->data);
+        state->history = g_list_delete_link(state->history, last);
+    }
+    state->current_product = p;
+    refresh_history(state);
+}
+
 /* ────────────────────────────────────────────────
  *  Home page
  * ──────────────────────────────────────────────── */
@@ -135,42 +159,33 @@ static void on_scan_clicked(GtkButton *btn, gpointer user_data);
 static void on_scan_entry_activate(GtkEntry *entry, gpointer user_data);
 static void on_camera_scan_clicked(GtkButton *btn, gpointer user_data);
 
+static void on_example_clicked(GtkButton *btn, gpointer user_data) {
+    const char *bc = g_object_get_data(G_OBJECT(btn), "barcode");
+    if (bc) do_lookup(user_data, bc);
+}
+
+/* Stops the scanner subprocess and any pending read. Safe to call repeatedly. */
 static void stop_camera_scan(AppState *state) {
     if (state->camera_cancel) {
         g_cancellable_cancel(state->camera_cancel);
-        g_object_unref(state->camera_cancel);
-        state->camera_cancel = NULL;
+        g_clear_object(&state->camera_cancel);
     }
-    if (state->camera_stream) {
-        g_object_unref(state->camera_stream);
-        state->camera_stream = NULL;
-    }
-    if (state->camera_buffer) {
-        g_string_free(state->camera_buffer, TRUE);
-        state->camera_buffer = NULL;
-    }
+    g_clear_object(&state->camera_stream);
     if (state->camera_proc) {
-        if (!g_subprocess_get_if_exited(state->camera_proc))
-            g_subprocess_force_exit(state->camera_proc);
-        g_object_unref(state->camera_proc);
-        state->camera_proc = NULL;
-    }
-    if (state->camera_preview_proc) {
-        if (!g_subprocess_get_if_exited(state->camera_preview_proc))
-            g_subprocess_force_exit(state->camera_preview_proc);
-        g_object_unref(state->camera_preview_proc);
-        state->camera_preview_proc = NULL;
+        /* force_exit is a no-op once the child has exited (and GSubprocess
+         * reaps it), so no exit check is needed — calling
+         * g_subprocess_get_if_exited() on a running child is a critical. */
+        g_subprocess_force_exit(state->camera_proc);
+        g_clear_object(&state->camera_proc);
     }
 }
 
-static gboolean barcode_is_numeric(const char *s) {
-    if (!s || !*s) return FALSE;
-    for (const char *p = s; *p; p++) {
-        if (!g_ascii_isdigit(*p)) return FALSE;
-    }
-    return TRUE;
+static void set_camera_status(AppState *state, const char *text) {
+    if (state->camera_status_label)
+        gtk_label_set_text(GTK_LABEL(state->camera_status_label), text);
 }
 
+/* Returns the first run of >= 8 digits in text (EAN-8 and longer). */
 static char *extract_barcode(const char *text) {
     if (!text) return NULL;
     const char *p = text;
@@ -180,93 +195,125 @@ static char *extract_barcode(const char *text) {
         const char *start = p;
         while (*p && g_ascii_isdigit(*p)) p++;
         gsize len = (gsize)(p - start);
-        if (len >= 8) return g_strndup(start, len);
+        if (len >= 8 && len <= LF_BARCODE_MAX_LEN) return g_strndup(start, len);
     }
     return NULL;
 }
 
 static void start_camera_read(AppState *state);
 
-static void on_camera_chunk_read(GObject *source, GAsyncResult *res, gpointer user_data) {
-    (void)source;
+/* The scanner prints exactly one line on stdout: either the barcode or a
+ * line starting with "ERROR:". Diagnostics go to stderr (inherited). */
+static void on_camera_line_read(GObject *source, GAsyncResult *res, gpointer user_data) {
     AppState *state = user_data;
-    if (!state->camera_stream) return;
-
     GError *err = NULL;
-    GBytes *bytes = g_input_stream_read_bytes_finish(state->camera_stream, res, &err);
+    gsize len = 0;
+    char *line = g_data_input_stream_read_line_finish_utf8(
+        G_DATA_INPUT_STREAM(source), res, &len, &err);
+
+    /* Cancelled, or a stale read from a previous scan session: the source
+     * stream is no longer ours, so don't touch scan state. */
+    if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
+        (GObject *)state->camera_stream != source) {
+        g_clear_error(&err);
+        g_free(line);
+        return;
+    }
 
     if (err) {
-        if (!g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED) &&
-            state->camera_status_label) {
-            gtk_label_set_text(GTK_LABEL(state->camera_status_label),
-                               "Camera scan stopped.");
-        }
+        g_warning("librefood: reading scanner output failed: %s", err->message);
+        set_camera_status(state, "Camera scan stopped unexpectedly.");
         g_clear_error(&err);
-        return;
-    }
-
-    if (!bytes || g_bytes_get_size(bytes) == 0) {
-        if (state->camera_status_label) {
-            gtk_label_set_text(GTK_LABEL(state->camera_status_label),
-                               "No barcode found. Try again.");
-        }
-        if (bytes) g_bytes_unref(bytes);
-        return;
-    }
-
-    gsize n = 0;
-    const gchar *chunk = g_bytes_get_data(bytes, &n);
-    if (!state->camera_buffer) state->camera_buffer = g_string_new(NULL);
-    g_string_append_len(state->camera_buffer, chunk, (gssize)n);
-
-    char *dbg = g_strndup(chunk, n);
-    char *trimmed_dbg = g_strstrip(dbg);
-    if (trimmed_dbg[0] != '\0') {
-        g_print("Scanner raw: %s\n", trimmed_dbg);
-    }
-    g_free(dbg);
-
-    char *barcode = extract_barcode(state->camera_buffer->str);
-    if (barcode && barcode_is_numeric(barcode)) {
-        g_print("Scanned barcode: %s\n", barcode);
-        gtk_editable_set_text(GTK_EDITABLE(state->scan_entry), barcode);
-        if (state->camera_dialog) {
-            gtk_window_destroy(GTK_WINDOW(state->camera_dialog));
-            state->camera_dialog = NULL;
-        }
         stop_camera_scan(state);
-        do_lookup(state, barcode);
-        g_free(barcode);
-        g_bytes_unref(bytes);
         return;
     }
-    g_free(barcode);
 
-    if (state->camera_status_label) {
-        gtk_label_set_text(GTK_LABEL(state->camera_status_label),
-                           "Reading camera... point barcode at lens.");
+    if (!line) {                                   /* EOF: scanner exited */
+        set_camera_status(state,
+            "Scanner closed without reading a barcode. "
+            "Close this window and try again.");
+        stop_camera_scan(state);
+        return;
     }
-    if (state->camera_buffer && state->camera_buffer->len > 4096) {
-        g_string_erase(state->camera_buffer, 0, state->camera_buffer->len - 1024);
+
+    g_strstrip(line);
+    if (g_str_has_prefix(line, "ERROR:")) {
+        set_camera_status(state, line);
+        g_free(line);
+        stop_camera_scan(state);
+        return;
     }
-    g_bytes_unref(bytes);
-    start_camera_read(state);
+
+    char *barcode = extract_barcode(line);
+    g_free(line);
+    if (!barcode) {                                /* ignore stray output */
+        start_camera_read(state);
+        return;
+    }
+
+    g_print("Scanned barcode: %s\n", barcode);
+    /* Destroying the dialog runs on_camera_dialog_destroy → stop_camera_scan. */
+    if (state->camera_dialog)
+        gtk_window_destroy(GTK_WINDOW(state->camera_dialog));
+    stop_camera_scan(state);
+    do_lookup(state, barcode);
+    g_free(barcode);
 }
 
 static void start_camera_read(AppState *state) {
     if (!state->camera_stream || !state->camera_cancel) return;
-    g_input_stream_read_bytes_async(
-        state->camera_stream, 512, G_PRIORITY_DEFAULT, state->camera_cancel,
-        on_camera_chunk_read, state);
+    g_data_input_stream_read_line_async(
+        state->camera_stream, G_PRIORITY_DEFAULT, state->camera_cancel,
+        on_camera_line_read, state);
 }
 
-static gboolean on_camera_dialog_close(GtkWindow *win, gpointer user_data) {
+/* "destroy" fires for every way the dialog goes away (window close button,
+ * Cancel button, successful scan, parent window destroyed). */
+static void on_camera_dialog_destroy(GtkWidget *win, gpointer user_data) {
     (void)win;
     AppState *state = user_data;
     stop_camera_scan(state);
     state->camera_dialog = NULL;
     state->camera_status_label = NULL;
-    return FALSE;
+}
+
+/* Directory containing the running executable, or NULL. */
+static char *exe_dir(void) {
+    char *exe = g_file_read_link("/proc/self/exe", NULL);
+    if (!exe) return NULL;
+    char *dir = g_path_get_dirname(exe);
+    g_free(exe);
+    return dir;
+}
+
+/* Finds opencv_scanner.py and a Python interpreter for it. Looks next to the
+ * executable first, then in the current directory. Prefers a project .venv
+ * and falls back to python3 on PATH (system-wide py3-opencv/py3-pyzbar). */
+static gboolean find_scanner(char **python_out, char **script_out) {
+    char *dirs[2] = { exe_dir(), g_get_current_dir() };
+    gboolean found = FALSE;
+    for (int i = 0; i < 2 && !found; i++) {
+        if (!dirs[i]) continue;
+        char *script = g_build_filename(dirs[i], "opencv_scanner.py", NULL);
+        if (g_file_test(script, G_FILE_TEST_IS_REGULAR)) {
+            char *venv = g_build_filename(dirs[i], ".venv", "bin", "python3", NULL);
+            if (g_file_test(venv, G_FILE_TEST_IS_EXECUTABLE)) {
+                *python_out = venv;
+            } else {
+                g_free(venv);
+                *python_out = g_find_program_in_path("python3");
+            }
+            if (*python_out) {
+                *script_out = script;
+                found = TRUE;
+                continue;
+            }
+        }
+        g_free(script);
+    }
+    g_free(dirs[0]);
+    g_free(dirs[1]);
+    return found;
 }
 
 GtkWidget *build_home_page(AppState *state) {
@@ -337,14 +384,7 @@ GtkWidget *build_home_page(AppState *state) {
         GtkWidget *pill = gtk_button_new_with_label(bc);
         gtk_widget_add_css_class(pill, "ns-scan-btn");
         g_object_set_data_full(G_OBJECT(pill), "barcode", bc, g_free);
-        g_signal_connect_swapped(pill, "clicked",
-            G_CALLBACK(do_lookup), state);
-        /* We need the barcode, not the button, as the arg — wire differently */
-        g_signal_handlers_disconnect_by_func(pill, do_lookup, state);
-        /* Re-wire: button clicked → set entry text → click search */
-        g_signal_connect_data(pill, "clicked",
-            G_CALLBACK(on_scan_clicked), state, NULL, 0);
-        /* store barcode for retrieval in callback */
+        g_signal_connect(pill, "clicked", G_CALLBACK(on_example_clicked), state);
         gtk_box_append(GTK_BOX(tips), pill);
     }
     gtk_box_append(GTK_BOX(hero), tips);
@@ -495,12 +535,13 @@ GtkWidget *build_product_page(AppState *state) {
     gtk_widget_set_valign(nova_num, GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(state->nova_badge), nova_num);
 
-    GtkWidget *nova_desc = gtk_label_new("");
-    gtk_widget_add_css_class(nova_desc, "ns-score-word");
+    state->nova_desc = gtk_label_new("");
+    gtk_widget_add_css_class(state->nova_desc, "ns-score-word");
+    gtk_label_set_xalign(GTK_LABEL(state->nova_desc), 0.0f);
 
     gtk_box_append(GTK_BOX(nova_box), nova_header);
     gtk_box_append(GTK_BOX(nova_box), state->nova_badge);
-    gtk_box_append(GTK_BOX(nova_box), nova_desc);
+    gtk_box_append(GTK_BOX(nova_box), state->nova_desc);
 
     gtk_box_append(GTK_BOX(score_row), ns_box);
     gtk_box_append(GTK_BOX(score_row), nova_box);
@@ -571,6 +612,7 @@ static void on_back_clicked(GtkButton *btn, gpointer user_data) {
 }
 
 void show_home(AppState *state) {
+    gtk_spinner_stop(GTK_SPINNER(state->spinner));
     gtk_label_set_text(GTK_LABEL(state->title_label), "librefood");
     gtk_widget_set_visible(state->back_button, FALSE);
     gtk_stack_set_visible_child_name(GTK_STACK(state->stack), "home");
@@ -617,7 +659,7 @@ void show_product(AppState *state, Product *p) {
 
     /* ── NOVA ── */
     const char *nova_classes[] = {
-        "ns-nova-1","ns-nova-2","ns-nova-3","ns-nova-4", NULL};
+        "ns-nova-1","ns-nova-2","ns-nova-3","ns-nova-4","ns-nova-unknown", NULL};
     for (int i = 0; nova_classes[i]; i++)
         gtk_widget_remove_css_class(state->nova_badge, nova_classes[i]);
 
@@ -633,6 +675,7 @@ void show_product(AppState *state, Product *p) {
         gtk_label_set_text(GTK_LABEL(nova_num),
             (p->nova_group && p->nova_group[0]) ? p->nova_group : "?");
     }
+    gtk_label_set_text(GTK_LABEL(state->nova_desc), nova_description(p->nova_group));
 
     /* ── Nutrition grid ── */
     GtkWidget *child;
@@ -680,35 +723,35 @@ void show_product(AppState *state, Product *p) {
         (p->ingredients_text && p->ingredients_text[0]) ?
         p->ingredients_text : "Not available.");
 
-    /* ── Reset product image ── */
+    /* ── Reset product image, then (re)fetch it; cancels any older one ── */
     gtk_image_set_from_icon_name(GTK_IMAGE(state->product_image),
         "image-x-generic");
+    fetch_image(state, p->image_url);
 
     /* ── Switch to product page ── */
-    char title[128];
-    snprintf(title, sizeof(title), "%.40s", p->product_name);
+    /* Truncate by characters, not bytes: a byte cut can split a UTF-8
+     * sequence and produce an invalid label string. */
+    char *title = g_utf8_strlen(p->product_name, -1) > 40
+        ? g_utf8_substring(p->product_name, 0, 40)
+        : g_strdup(p->product_name);
     gtk_label_set_text(GTK_LABEL(state->title_label), title);
+    g_free(title);
+    gtk_spinner_stop(GTK_SPINNER(state->spinner));
     gtk_widget_set_visible(state->back_button, TRUE);
     gtk_stack_set_visible_child_name(GTK_STACK(state->stack), "product");
-
-    /* Refresh history list */
-    GtkWidget *hchild;
-    while ((hchild = gtk_widget_get_first_child(state->history_list)))
-        gtk_list_box_remove(GTK_LIST_BOX(state->history_list), hchild);
-
-    for (GList *l = state->history; l; l = l->next) {
-        Product *hp = l->data;
-        GtkWidget *row = make_history_row(hp);
-        gtk_list_box_insert(GTK_LIST_BOX(state->history_list), row, -1);
-    }
 }
 
 /* ────────────────────────────────────────────────
  *  Scan action
  * ──────────────────────────────────────────────── */
 
-void do_lookup(AppState *state, const char *barcode) {
-    if (!barcode || barcode[0] == '\0') return;
+gboolean do_lookup(AppState *state, const char *input) {
+    char *barcode = barcode_normalize(input);
+    if (!barcode) {
+        show_error(state, "Please enter a valid barcode (digits only, "
+                          "e.g. 3017620422003).");
+        return FALSE;
+    }
 
     gtk_stack_set_visible_child_name(GTK_STACK(state->stack), "loading");
     gtk_spinner_start(GTK_SPINNER(state->spinner));
@@ -716,6 +759,8 @@ void do_lookup(AppState *state, const char *barcode) {
     gtk_label_set_text(GTK_LABEL(state->title_label), "Searching…");
 
     fetch_product(state, barcode);
+    g_free(barcode);
+    return TRUE;
 }
 
 static void on_scan_clicked(GtkButton *btn, gpointer user_data) {
@@ -723,11 +768,9 @@ static void on_scan_clicked(GtkButton *btn, gpointer user_data) {
     AppState *state = user_data;
     const char *text = gtk_editable_get_text(GTK_EDITABLE(state->scan_entry));
     if (!text || text[0] == '\0') return;
-    /* Strip spaces */
-    char *trimmed = g_strstrip(g_strdup(text));
-    do_lookup(state, trimmed);
-    g_free(trimmed);
-    gtk_editable_set_text(GTK_EDITABLE(state->scan_entry), "");
+    /* Keep the text on invalid input so the user can correct it. */
+    if (do_lookup(state, text))
+        gtk_editable_set_text(GTK_EDITABLE(state->scan_entry), "");
 }
 
 static void on_scan_entry_activate(GtkEntry *entry, gpointer user_data) {
@@ -739,14 +782,15 @@ static void on_camera_scan_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     AppState *state = user_data;
 
-    if (!g_file_test(".venv/bin/python3", G_FILE_TEST_EXISTS) ||
-        !g_file_test("opencv_scanner.py", G_FILE_TEST_EXISTS)) {
-        show_error(state, "OpenCV scanner files missing. Rebuild project setup.");
+    if (state->camera_dialog) {
+        gtk_window_present(GTK_WINDOW(state->camera_dialog));
         return;
     }
 
-    if (state->camera_dialog) {
-        gtk_window_present(GTK_WINDOW(state->camera_dialog));
+    char *python = NULL, *script = NULL;
+    if (!find_scanner(&python, &script)) {
+        show_error(state, "Camera scanner unavailable: opencv_scanner.py or "
+                          "python3 not found. Run build.sh to install it.");
         return;
     }
 
@@ -755,6 +799,7 @@ static void on_camera_scan_clicked(GtkButton *btn, gpointer user_data) {
     gtk_window_set_title(GTK_WINDOW(dialog), "Scan Barcode");
     gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(state->window));
     gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_destroy_with_parent(GTK_WINDOW(dialog), TRUE);
     gtk_window_set_default_size(GTK_WINDOW(dialog), 380, 160);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -781,15 +826,15 @@ static void on_camera_scan_clicked(GtkButton *btn, gpointer user_data) {
     gtk_box_append(GTK_BOX(box), cancel);
     gtk_window_set_child(GTK_WINDOW(dialog), box);
 
-    g_signal_connect(dialog, "close-request", G_CALLBACK(on_camera_dialog_close), state);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(on_camera_dialog_destroy), state);
 
-    const char *argv[] = {
-        ".venv/bin/python3", "opencv_scanner.py",
-        NULL
-    };
+    const char *argv[] = { python, script, NULL };
     GError *err = NULL;
-    state->camera_proc = g_subprocess_newv(
-        argv, G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_MERGE, &err);
+    /* stderr is inherited (not merged) so warnings/tracebacks can't be
+     * mistaken for a barcode and remain visible for debugging. */
+    state->camera_proc = g_subprocess_newv(argv, G_SUBPROCESS_FLAGS_STDOUT_PIPE, &err);
+    g_free(python);
+    g_free(script);
     if (!state->camera_proc) {
         gtk_label_set_text(GTK_LABEL(state->camera_status_label),
                            err ? err->message : "Unable to access camera.");
@@ -798,10 +843,9 @@ static void on_camera_scan_clicked(GtkButton *btn, gpointer user_data) {
         return;
     }
 
-    state->camera_stream = g_object_ref(
+    state->camera_stream = g_data_input_stream_new(
         g_subprocess_get_stdout_pipe(state->camera_proc));
     state->camera_cancel = g_cancellable_new();
-    state->camera_buffer = g_string_new(NULL);
     start_camera_read(state);
     gtk_widget_set_visible(dialog, TRUE);
 }
@@ -810,19 +854,46 @@ static void on_camera_scan_clicked(GtkButton *btn, gpointer user_data) {
  *  App activation
  * ──────────────────────────────────────────────── */
 
+/* Main window closing: kill the scanner child (it would otherwise outlive
+ * the app) and cancel network I/O. AppState itself is intentionally not
+ * freed: cancelled async callbacks may still be dispatched and reference it,
+ * and the process exits right after. */
+static void on_main_window_destroy(GtkWidget *win, gpointer user_data) {
+    (void)win;
+    AppState *state = user_data;
+    if (state->camera_dialog)
+        gtk_window_destroy(GTK_WINDOW(state->camera_dialog));
+    stop_camera_scan(state);
+    cancel_network(state);
+}
+
 void on_activate(GtkApplication *app, gpointer user_data) {
     (void)user_data;
+
+    /* A second launch re-activates the running instance: reuse its window
+     * instead of building a second, independent AppState. */
+    GtkWindow *existing = gtk_application_get_active_window(app);
+    if (existing) {
+        gtk_window_present(existing);
+        return;
+    }
+
     apply_css();
 
     AppState *state = g_new0(AppState, 1);
     state->app = app;
-    state->http_session = soup_session_new();
+    g_object_set_data(G_OBJECT(app), "librefood-state", state);
+    state->http_session = soup_session_new_with_options(
+        "user-agent", LF_USER_AGENT,          /* OFF requires a UA */
+        "timeout", LF_HTTP_TIMEOUT_SEC,       /* never hang on the spinner */
+        NULL);
 
     /* Window */
     state->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(state->window), "librefood");
     gtk_window_set_default_size(GTK_WINDOW(state->window), 420, 700);
     gtk_window_set_resizable(GTK_WINDOW(state->window), TRUE);
+    g_signal_connect(state->window, "destroy", G_CALLBACK(on_main_window_destroy), state);
 
     /* Header bar */
     state->header_bar = gtk_header_bar_new();

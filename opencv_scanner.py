@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
+"""Camera barcode scanner for librefood.
+
+Protocol (stdout, one line): the decoded numeric barcode on success, or a
+line starting with "ERROR:" on failure. Everything else goes to stderr.
+Exit status: 0 = barcode printed, 1 = error/cancelled.
+"""
 import sys
-import cv2
-from pyzbar.pyzbar import decode
+import time
+
+try:
+    import cv2
+    from pyzbar.pyzbar import decode
+except ImportError as exc:  # missing py3-opencv / py3-pyzbar
+    print(f"ERROR: Scanner dependencies missing ({exc.name}). Run build.sh.", flush=True)
+    raise SystemExit(1)
+
+WINDOW = "librefood camera scan"
+MAX_CONSECUTIVE_READ_FAILURES = 50   # ~2.5 s at 50 ms/retry
 
 
 def detect_barcode(frame):
@@ -17,7 +32,8 @@ def detect_barcode(frame):
         symbols = decode(img)
         for sym in symbols:
             text = sym.data.decode("utf-8", errors="ignore").strip()
-            if text:
+            # Product barcodes are numeric; ignore QR codes with URLs etc.
+            if len(text) >= 8 and text.isdigit():
                 return text, sym
     return None, None
 
@@ -32,14 +48,29 @@ def main() -> int:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
 
-    cv2.namedWindow("librefood camera scan", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("librefood camera scan", 960, 540)
+    try:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW, 960, 540)
+    except cv2.error as exc:
+        cap.release()
+        print("ERROR: Could not open preview window (no display or GUI support).", flush=True)
+        print(exc, file=sys.stderr)
+        return 1
 
+    failures = 0
     try:
         while True:
             ok, frame = cap.read()
-            if not ok:
+            if not ok or frame is None:
+                # Camera unplugged / in use: don't spin forever at 100% CPU
+                # with an unresponsive window.
+                failures += 1
+                if failures >= MAX_CONSECUTIVE_READ_FAILURES:
+                    print("ERROR: Camera stopped delivering frames.", flush=True)
+                    return 1
+                time.sleep(0.05)
                 continue
+            failures = 0
 
             text, sym = detect_barcode(frame)
             if text:
@@ -60,8 +91,12 @@ def main() -> int:
                 cv2.LINE_AA,
             )
 
-            cv2.imshow("librefood camera scan", frame)
+            cv2.imshow(WINDOW, frame)
             if cv2.waitKey(1) & 0xFF == 27:
+                return 1
+            # Window closed via its title bar: treat as cancel (otherwise
+            # imshow would silently re-create it on the next frame).
+            if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                 return 1
     finally:
         cap.release()

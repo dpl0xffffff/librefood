@@ -20,6 +20,13 @@
 #define COLOR_SCORE_D     "#E67E22"   /* orange – poor      */
 #define COLOR_SCORE_E     "#E74C3C"   /* red    – bad       */
 
+/* ── Network ── */
+#define LF_USER_AGENT          "librefood/1.0 (davide.plozner@etik.com)"
+#define LF_HTTP_TIMEOUT_SEC    15     /* per-request I/O timeout */
+#define LF_HISTORY_MAX         50     /* bound on in-memory scan history */
+#define LF_BARCODE_MIN_LEN     4
+#define LF_BARCODE_MAX_LEN     24
+
 /* ── Data model ── */
 typedef struct {
     char *barcode;
@@ -27,6 +34,7 @@ typedef struct {
     char *brand;
     char *image_url;
     char *nutriscore_grade;   /* "a".."e" or NULL */
+    /* Nutriment values per 100 g; NAN when unknown (distinct from 0). */
     double energy_kcal;
     double fat;
     double saturated_fat;
@@ -75,27 +83,28 @@ typedef struct {
     GtkWidget       *score_letter;
     GtkWidget       *score_desc;
     GtkWidget       *nova_badge;
+    GtkWidget       *nova_desc;
     GtkWidget       *nutrition_grid;
     GtkWidget       *ingredients_label;
     GtkWidget       *additives_box;
 
     /* HTTP session */
     SoupSession     *http_session;
+    GCancellable    *fetch_cancel;   /* in-flight product lookup, or NULL */
+    GCancellable    *image_cancel;   /* in-flight image download, or NULL */
 
-    /* Current product */
+    /* Current product (borrowed; owned by history) */
     Product         *current_product;
 
-    /* Scan history (GList of Product*) */
+    /* Scan history (GList of Product*, owns its elements, newest first) */
     GList           *history;
 
     /* Camera scan session */
     GtkWidget       *camera_dialog;
     GtkWidget       *camera_status_label;
-    GSubprocess     *camera_preview_proc;
     GSubprocess     *camera_proc;
-    GInputStream    *camera_stream;
+    GDataInputStream *camera_stream;
     GCancellable    *camera_cancel;
-    GString         *camera_buffer;
 } AppState;
 
 /* ── Function declarations ── */
@@ -107,14 +116,25 @@ GtkWidget *build_loading_page(AppState *state);
 GtkWidget *build_product_page(AppState *state);
 
 /* Actions */
-void do_lookup(AppState *state, const char *barcode);
+/* Validates input; returns FALSE (after showing an error) if invalid. */
+gboolean do_lookup(AppState *state, const char *input);
 void show_product(AppState *state, Product *p);
 void show_home(AppState *state);
 void show_error(AppState *state, const char *msg);
 
 /* HTTP / parsing */
 void fetch_product(AppState *state, const char *barcode);
+void fetch_image(AppState *state, const char *url);
+void cancel_network(AppState *state);
+/* Parses a full OFF API response object. Returns NULL unless status == 1
+ * and a product object is present. Tolerates null/mistyped fields. */
 Product *parse_product_json(JsonObject *root, const char *barcode);
+/* Strips spaces/dashes; returns a newly allocated digits-only barcode, or
+ * NULL if the input is not a plausible barcode. */
+char *barcode_normalize(const char *input);
+
+/* History */
+void history_add(AppState *state, Product *p);
 
 /* Helpers */
 const char *score_color(const char *grade);
